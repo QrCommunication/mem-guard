@@ -1,0 +1,13 @@
+# Artefacts de build
+/build/
+/dist/
+*.deb
+
+# Python
+__pycache__/
+*.pyc
+
+# Divers
+*.bak
+*.bak.*
+*~

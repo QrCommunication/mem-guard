@@ -1,0 +1,22 @@
+#!/bin/sh
+# Réveille l'instance mem-guard DÉJÀ lancée et la fait surgir au premier plan.
+# Conçu pour le raccourci clavier anti-OOM : ne relance JAMAIS un interpréteur
+# python (trop lourd quand le PC swappe). Trois voies, de la plus légère à la
+# plus robuste.
+export DISPLAY="${DISPLAY:-:0}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}"
+
+# 1) D-Bus : demande à l'app GTK de s'activer (≈ 0 coût)
+if gdbus call --session --dest org.rony.memguard \
+     --object-path /org/rony/memguard \
+     --method org.freedesktop.Application.Activate "{}" >/dev/null 2>&1; then
+    exit 0
+fi
+
+# 2) Signal direct au process vivant
+if pkill -USR1 -f 'python3 .*/mem-guard$' 2>/dev/null; then
+    exit 0
+fi
+
+# 3) Dernier recours : démarrage à froid
+exec mem-guard --open

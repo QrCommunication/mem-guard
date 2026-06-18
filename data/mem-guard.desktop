@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=mem-guard — Gestionnaire de crise
+Comment=Surveillance RAM/CPU et gestionnaire de processus (tuer/redémarrer en cas de saturation)
+Exec=mem-guard --open
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;Utility;
+Keywords=ram;memory;mémoire;cpu;process;processus;kill;tuer;moniteur;crise;oom;
+StartupNotify=false

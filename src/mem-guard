@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+mem-guard — Boîte noire mémoire + gestionnaire de crise RAM/CPU (GTK3)
+
+Évolution du mem-guard.sh d'origine :
+  - conserve la boîte noire CSV + les alertes anti-freeze (post-mortem),
+  - ajoute une icône permanente dans la barre des tâches (AppIndicator),
+  - ajoute une fenêtre « gestionnaire de processus » sur mesure : liste de
+    chaque process (PID, nom, titre de fenêtre, CPU %, RAM % / Mo) avec un
+    bouton pour tuer (SIGTERM) ou forcer (SIGKILL).
+
+La fenêtre s'ouvre :
+  - en cliquant sur la notification d'alerte (action « Ouvrir »),
+  - via le menu de l'icône de barre des tâches (« Ouvrir le gestionnaire »),
+  - au lancement manuel : `mem-guard --open`.
+
+Lancé comme service systemd --user (voir ~/.config/systemd/user/mem-guard.service)
+donc présent dès l'ouverture de session.
+
+Mis en place suite au freeze du 2026-06-03 (livelock mémoire, hard-reset).
+"""
+import os
+import sys
+import json
+import time
+import shutil
+import signal
+import subprocess
+from datetime import datetime
+
+import psutil
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk, GLib, Gdk, Gio, Pango  # noqa: E402
+
+# --- Notifications (libnotify) — optionnel -----------------------------------
+try:
+    gi.require_version("Notify", "0.7")
+    from gi.repository import Notify
+    Notify.init("mem-guard")
+    HAVE_NOTIFY = True
+except Exception:
+    HAVE_NOTIFY = False
+
+# --- Icône de barre des tâches (AppIndicator) — avec repli ------------------
+AppIndicator = None
+for _ver in ("AyatanaAppIndicator3", "AppIndicator3"):
+    try:
+        gi.require_version(_ver, "0.1")
+        AppIndicator = __import__("gi.repository." + _ver, fromlist=[_ver])
+        break
+    except Exception:
+        AppIndicator = None
+
+# --- Configuration (surchargeable via l'environnement du service) -----------
+INTERVAL      = int(os.environ.get("MEMGUARD_INTERVAL", "20"))   # s entre 2 mesures
+WARN_PCT      = int(os.environ.get("MEMGUARD_WARN", "85"))       # seuil alerte RAM %
+CRIT_PCT      = int(os.environ.get("MEMGUARD_CRIT", "92"))       # seuil critique RAM %
+SWAP_WARN     = int(os.environ.get("MEMGUARD_SWAP_WARN", "60"))  # seuil alerte swap %
+NOTIFY_THROTTLE = int(os.environ.get("MEMGUARD_THROTTLE", "120"))  # s mini entre 2 notifs
+RETENTION_DAYS  = int(os.environ.get("MEMGUARD_RETENTION", "14"))  # rétention logs
+STATE_DIR     = os.environ.get("MEMGUARD_STATE",
+                               os.path.expanduser("~/.local/state/mem-guard"))
+UI_REFRESH    = 2  # s — rafraîchissement de la fenêtre quand elle est visible
+
+os.makedirs(STATE_DIR, exist_ok=True)
+
+
+def human_mb(n_bytes):
+    return int(n_bytes / (1024 * 1024))
+
+
+def read_mem():
+    """Lecture mémoire/swap depuis /proc/meminfo (compatible avec l'ancien CSV)."""
+    info = {}
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            k, _, rest = line.partition(":")
+            info[k] = int(rest.strip().split()[0])  # kB
+    mem_total = info["MemTotal"]
+    mem_avail = info.get("MemAvailable", info["MemFree"])
+    swap_total = info.get("SwapTotal", 0)
+    swap_free = info.get("SwapFree", 0)
+    mem_pct = (mem_total - mem_avail) * 100 // mem_total
+    swap_pct = ((swap_total - swap_free) * 100 // swap_total) if swap_total else 0
+    return {
+        "mem_pct": mem_pct, "swap_pct": swap_pct,
+        "mem_total": mem_total, "swap_total": swap_total,
+    }
+
+
+def window_titles_by_pid():
+    """Map PID -> [titres de fenêtres] via wmctrl (X11). Vide si indisponible."""
+    titles = {}
+    try:
+        out = subprocess.run(["wmctrl", "-lp"], capture_output=True,
+                             text=True, timeout=2).stdout
+    except Exception:
+        return titles
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) >= 5:
+            try:
+                pid = int(parts[2])
+            except ValueError:
+                continue
+            title = parts[4].strip()
+            if title:
+                titles.setdefault(pid, []).append(title)
+    return titles
+
+
+def tmux_pane_labels():
+    """Map pid_avant-plan -> 'session:fenêtre' pour toutes les sockets tmux.
+
+    Les CLI dans tmux tournent sous un serveur détaché (sans fenêtre X) : tmux
+    est la seule source qui sait quel pane contient quoi.
+    """
+    labels = {}
+    if not shutil.which("tmux"):
+        return labels
+    sockdir = "/tmp/tmux-%d" % os.getuid()
+    try:
+        socks = os.listdir(sockdir)
+    except OSError:
+        return labels
+    for name in socks:
+        try:
+            out = subprocess.run(
+                ["tmux", "-L", name, "list-panes", "-a", "-F",
+                 "#{pane_pid}\t#{session_name}:#{window_name}"],
+                capture_output=True, text=True, timeout=2).stdout
+        except Exception:
+            continue
+        for line in out.splitlines():
+            pid_s, _, label = line.partition("\t")
+            try:
+                labels[int(pid_s)] = label.strip()
+            except ValueError:
+                pass
+    return labels
+
+
+def kitty_pane_labels(kitty_pids):
+    """Map pid -> 'onglet › split' via le contrôle distant kitty.
+
+    Indispensable car kitty gère N fenêtres + onglets + splits dans UN process :
+    X ne voit que le PID kitty. `kitty @ ls` donne le détail par process
+    d'avant-plan. Nécessite allow_remote_control + listen_on (sinon vide).
+    """
+    labels = {}
+    exe = shutil.which("kitty") or shutil.which("kitten")
+    if not exe:
+        return labels
+    seen = set()
+    for kp in kitty_pids:
+        try:
+            with open("/proc/%d/environ" % kp, "rb") as fh:
+                env = fh.read().split(b"\0")
+        except OSError:
+            continue
+        addr = None
+        for e in env:
+            if e.startswith(b"KITTY_LISTEN_ON="):
+                addr = e.split(b"=", 1)[1].decode(errors="replace")
+                break
+        if not addr or addr in seen:
+            continue
+        seen.add(addr)
+        try:
+            out = subprocess.run([exe, "@", "--to", addr, "ls"],
+                                capture_output=True, text=True, timeout=2).stdout
+            data = json.loads(out)
+        except Exception:
+            continue
+        for osw in data:
+            for tab in osw.get("tabs", []):
+                ttitle = tab.get("title", "")
+                for pane in tab.get("windows", []):
+                    ptitle = pane.get("title", "")
+                    if ptitle and ptitle != ttitle:
+                        label = "🐱 %s › %s" % (ttitle, ptitle)
+                    else:
+                        label = "🐱 %s" % ttitle
+                    label = label[:160]
+                    pids = set()
+                    if pane.get("pid"):
+                        pids.add(pane["pid"])
+                    for fg in pane.get("foreground_processes", []):
+                        if fg.get("pid"):
+                            pids.add(fg["pid"])
+                    for pp in pids:
+                        labels[pp] = label
+    return labels
+
+
+# ============================================================================
+#  Fenêtre : gestionnaire de processus
+# ============================================================================
+class ProcessWindow(Gtk.Window):
+    # colonnes du ListStore
+    COL_PID, COL_NAME, COL_WIN, COL_CPU, COL_MEMPCT, COL_RSS, COL_USER = range(7)
+
+    def __init__(self, app):
+        super().__init__(title="mem-guard — Gestionnaire de crise")
+        self.app = app
+        self.set_default_size(940, 580)
+        self.set_icon_name("utilities-system-monitor")
+        self._cache = {}          # pid -> psutil.Process (continuité cpu_percent)
+        self._timer = None
+        self.connect("delete-event", self._on_close)
+        self.connect("key-press-event", self._on_key)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        root.set_border_width(8)
+        self.add(root)
+
+        # --- En-tête : jauges RAM / swap / CPU / charge ---
+        hdr = Gtk.Grid(column_spacing=10, row_spacing=4)
+        root.pack_start(hdr, False, False, 0)
+
+        self.ram_bar = Gtk.ProgressBar(show_text=True)
+        self.swap_bar = Gtk.ProgressBar(show_text=True)
+        self.ram_bar.set_hexpand(True)
+        self.swap_bar.set_hexpand(True)
+        hdr.attach(Gtk.Label(label="RAM", xalign=0), 0, 0, 1, 1)
+        hdr.attach(self.ram_bar, 1, 0, 1, 1)
+        hdr.attach(Gtk.Label(label="Swap", xalign=0), 0, 1, 1, 1)
+        hdr.attach(self.swap_bar, 1, 1, 1, 1)
+        self.sys_lbl = Gtk.Label(xalign=0)
+        self.sys_lbl.set_markup("<small>CPU — · charge —</small>")
+        hdr.attach(self.sys_lbl, 0, 2, 2, 1)
+
+        # --- Barre d'outils ---
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        root.pack_start(bar, False, False, 0)
+
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text("Filtrer (nom, fenêtre, PID)…")
+        self.search.connect("search-changed", lambda *_: self._refilter())
+        self.search.set_hexpand(True)
+        bar.pack_start(self.search, True, True, 0)
+
+        btn_restart = Gtk.Button(label="Redémarrer")
+        btn_restart.set_tooltip_text(
+            "Relance le process avec la même commande/dossier/environnement "
+            "(best-effort ; un process attaché à un terminal repart détaché)")
+        btn_restart.connect("clicked", lambda *_: self._restart())
+        bar.pack_start(btn_restart, False, False, 0)
+
+        btn_kill = Gtk.Button(label="Terminer (SIGTERM)")
+        btn_kill.connect("clicked", lambda *_: self._kill(signal.SIGTERM))
+        bar.pack_start(btn_kill, False, False, 0)
+
+        btn_force = Gtk.Button(label="Forcer (SIGKILL)")
+        btn_force.get_style_context().add_class("destructive-action")
+        btn_force.connect("clicked", lambda *_: self._kill(signal.SIGKILL))
+        bar.pack_start(btn_force, False, False, 0)
+
+        btn_ref = Gtk.Button.new_from_icon_name("view-refresh-symbolic",
+                                                Gtk.IconSize.BUTTON)
+        btn_ref.set_tooltip_text("Rafraîchir")
+        btn_ref.connect("clicked", lambda *_: self.refresh())
+        bar.pack_start(btn_ref, False, False, 0)
+
+        # --- Tableau des processus ---
+        # store + filtre + tri
+        self.store = Gtk.ListStore(int, str, str, float, float, int, str)
+        self.filt = self.store.filter_new()
+        self.filt.set_visible_func(self._filter_func)
+        self.sortm = Gtk.TreeModelSort(model=self.filt)
+        self.view = Gtk.TreeView(model=self.sortm)
+        self.view.set_rubber_banding(True)
+        self.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self.view.connect("row-activated",
+                          lambda *_: self._kill(signal.SIGTERM))
+
+        def add_col(title, col_id, kind="text"):
+            rnd = Gtk.CellRendererText()
+            if kind in ("num", "cpu", "pct", "mb"):
+                rnd.set_property("xalign", 1.0)
+            column = Gtk.TreeViewColumn(title, rnd)
+            # NB : le callback cell_data_func reçoit 5 args (col, cell, model,
+            # iter, data) — d'où le *_, sinon exception silencieuse = cellule vide.
+            if kind == "cpu":
+                column.set_cell_data_func(
+                    rnd, lambda c, r, m, it, *_: r.set_property(
+                        "text", f"{m.get_value(it, col_id):.0f}"))
+            elif kind == "pct":
+                column.set_cell_data_func(
+                    rnd, lambda c, r, m, it, *_: r.set_property(
+                        "text", f"{m.get_value(it, col_id):.1f}"))
+            elif kind == "mb":
+                column.set_cell_data_func(
+                    rnd, lambda c, r, m, it, *_: r.set_property(
+                        "text", f"{m.get_value(it, col_id):,}".replace(",", " ")))
+            else:
+                column.add_attribute(rnd, "text", col_id)
+            column.set_sort_column_id(col_id)
+            column.set_resizable(True)
+            if col_id == self.COL_NAME:
+                column.set_expand(False)
+            if col_id == self.COL_WIN:
+                rnd.set_property("ellipsize", Pango.EllipsizeMode.END)
+                column.set_expand(True)
+            self.view.append_column(column)
+
+        add_col("PID", self.COL_PID, "num")
+        add_col("Processus", self.COL_NAME)
+        add_col("Fenêtre", self.COL_WIN)
+        add_col("CPU %", self.COL_CPU, "cpu")
+        add_col("RAM %", self.COL_MEMPCT, "pct")
+        add_col("RAM (Mo)", self.COL_RSS, "mb")
+        add_col("Utilisateur", self.COL_USER)
+
+        # tri par défaut : RAM (Mo) décroissant
+        self.sortm.set_sort_column_id(self.COL_RSS, Gtk.SortType.DESCENDING)
+
+        scr = Gtk.ScrolledWindow()
+        scr.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scr.add(self.view)
+        root.pack_start(scr, True, True, 0)
+
+        self.status = Gtk.Label(xalign=0)
+        root.pack_start(self.status, False, False, 0)
+
+    # --- filtrage ---
+    def _filter_func(self, model, it, _data):
+        q = self.search.get_text().strip().lower()
+        if not q:
+            return True
+        name = (model.get_value(it, self.COL_NAME) or "").lower()
+        win = (model.get_value(it, self.COL_WIN) or "").lower()
+        pid = str(model.get_value(it, self.COL_PID))
+        return q in name or q in win or q in pid
+
+    def _refilter(self):
+        self.filt.refilter()
+
+    # --- sélection -> PIDs ---
+    def _selected_pids(self):
+        model, paths = self.view.get_selection().get_selected_rows()
+        pids = []
+        for p in paths:
+            it = model.get_iter(p)
+            pids.append((model.get_value(it, self.COL_PID),
+                        model.get_value(it, self.COL_NAME)))
+        return pids
+
+    def _kill(self, sig):
+        targets = self._selected_pids()
+        if not targets:
+            return
+        names = "\n".join(f"  • {pid} — {name}" for pid, name in targets[:12])
+        more = "" if len(targets) <= 12 else f"\n  … (+{len(targets) - 12})"
+        verb = "FORCER (SIGKILL)" if sig == signal.SIGKILL else "terminer (SIGTERM)"
+        dlg = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=f"{verb} {len(targets)} processus ?")
+        dlg.format_secondary_text(names + more)
+        if dlg.run() == Gtk.ResponseType.OK:
+            for pid, _name in targets:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    # process root : tentative via sudo -n (NOPASSWD si dispo)
+                    subprocess.run(["sudo", "-n", "kill", f"-{int(sig)}",
+                                   str(pid)], capture_output=True)
+        dlg.destroy()
+        GLib.timeout_add(300, lambda: (self.refresh(), False)[1])
+
+    # --- redémarrer (best-effort : capture cmdline/cwd/env AVANT de tuer) ---
+    def _restart(self):
+        targets = self._selected_pids()
+        if not targets:
+            return
+        plans, skipped = [], []
+        for pid, name in targets:
+            try:
+                p = psutil.Process(pid)
+                cmd = p.cmdline()
+                if not cmd:
+                    skipped.append(f"{pid} {name} (process noyau / sans commande)")
+                    continue
+                try:
+                    cwd = p.cwd()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    cwd = None
+                try:
+                    env = p.environ()
+                except (psutil.AccessDenied, psutil.NoSuchProcess):
+                    env = None
+                plans.append((pid, name, cmd, cwd, env))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                skipped.append(f"{pid} {name} (inaccessible)")
+        if not plans:
+            self._info("Redémarrage impossible",
+                       "Aucun process redémarrable.\n" + "\n".join(skipped))
+            return
+        lst = "\n".join(f"  • {pid} — {name}\n      {' '.join(cmd)[:88]}"
+                        for pid, name, cmd, *_ in plans[:10])
+        warn = ("\n\n⚠ Best-effort : un process attaché à un terminal "
+                "(claude, vim…) repartira DÉTACHÉ du terminal.")
+        dlg = Gtk.MessageDialog(
+            transient_for=self, modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=f"Redémarrer {len(plans)} process ?")
+        dlg.format_secondary_text(lst + warn)
+        if dlg.run() == Gtk.ResponseType.OK:
+            for pid, name, cmd, cwd, env in plans:
+                self._do_restart(pid, cmd, cwd, env)
+        dlg.destroy()
+        GLib.timeout_add(1200, lambda: (self.refresh(), False)[1])
+
+    def _do_restart(self, pid, cmd, cwd, env):
+        # 1) arrêt propre (SIGTERM), SIGKILL en dernier recours
+        try:
+            p = psutil.Process(pid)
+            p.terminate()
+            try:
+                p.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                p.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            subprocess.run(["sudo", "-n", "kill", str(pid)], capture_output=True)
+        # 2) relance détachée, même commande / dossier / environnement
+        try:
+            subprocess.Popen(
+                cmd, cwd=cwd or None, env=env or None,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception as e:
+            self._info("Échec du redémarrage",
+                       f"PID {pid} : {e}\nCommande : {' '.join(cmd)[:120]}")
+
+    def _info(self, title, body):
+        d = Gtk.MessageDialog(transient_for=self, modal=True,
+                              message_type=Gtk.MessageType.INFO,
+                              buttons=Gtk.ButtonsType.OK, text=title)
+        d.format_secondary_text(body)
+        d.run()
+        d.destroy()
+
+    # --- rafraîchissement de la liste ---
+    def refresh(self):
+        wins = window_titles_by_pid()
+        seen = set()
+
+        # 1er passage : carte pid -> ppid (pour remonter l'arbre vers la fenêtre)
+        ppid_of = {}
+        procs = []
+        kitty_pids = []
+        for proc in psutil.process_iter(["pid", "name", "username", "ppid"]):
+            try:
+                info = proc.info
+                ppid_of[info["pid"]] = info["ppid"]
+                procs.append(info)
+                if (info["name"] or "").startswith("kitty"):
+                    kitty_pids.append(info["pid"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+
+        # résolveurs précis (par onglet/split/pane) pour les terminaux mux
+        kitty_map = kitty_pane_labels(kitty_pids)
+        panes = tmux_pane_labels()
+
+        def resolve_title(pid):
+            # On remonte l'arbre et on s'arrête au 1er match : comme le plus
+            # précis (kitty split / tmux pane) est le plus PROCHE du CLI et la
+            # fenêtre X (kitty/terminal-server) la plus HAUTE, le plus profond
+            # gagne naturellement. Priorité à chaque niveau : kitty > tmux > X.
+            cur, depth, guard = pid, 0, set()
+            while cur and cur > 1 and depth < 20 and cur not in guard:
+                if cur in kitty_map:
+                    return kitty_map[cur]
+                if cur in panes:
+                    return "⊞ " + panes[cur]
+                if cur in wins:
+                    seen_t, uniq = set(), []
+                    for t in wins[cur]:
+                        if t not in seen_t:
+                            seen_t.add(t)
+                            uniq.append(t)
+                    return " · ".join(uniq)[:160]
+                guard.add(cur)
+                cur = ppid_of.get(cur)
+                depth += 1
+            return ""
+
+        rows = []
+        for info in procs:
+            pid = info["pid"]
+            seen.add(pid)
+            try:
+                cached = self._cache.get(pid)
+                if cached is None:
+                    cached = psutil.Process(pid)
+                    self._cache[pid] = cached
+                    cached.cpu_percent(None)  # amorçage (1er appel = 0)
+                cpu = cached.cpu_percent(None)
+                rss = cached.memory_info().rss
+                mempct = cached.memory_percent()
+                name = info["name"] or "?"
+                user = (info["username"] or "")[:16]
+                rows.append([pid, name, resolve_title(pid), cpu, mempct,
+                            human_mb(rss), user])
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        # purge du cache des PID disparus
+        for dead in [p for p in self._cache if p not in seen]:
+            del self._cache[dead]
+
+        # préserver la sélection (par PID) au rebuild
+        prev = {pid for pid, _ in self._selected_pids()}
+        self.store.clear()
+        for r in rows:
+            self.store.append(r)
+        if prev:
+            sel = self.view.get_selection()
+            self.sortm.foreach(self._reselect, (prev, sel))
+
+        m = read_mem()
+        cpu_sys = psutil.cpu_percent(None)
+        load = os.getloadavg()[0]
+        self.ram_bar.set_fraction(m["mem_pct"] / 100)
+        self.ram_bar.set_text(f"{m['mem_pct']} %")
+        self.swap_bar.set_fraction(m["swap_pct"] / 100)
+        self.swap_bar.set_text(f"{m['swap_pct']} %")
+        self.sys_lbl.set_markup(
+            f"<small>CPU {cpu_sys:.0f} % · charge {load:.2f} · "
+            f"{len(rows)} processus</small>")
+        self.status.set_markup(
+            "<small>Astuce : double-clic ou « Terminer » = SIGTERM. "
+            "Tri par colonne. Ctrl/Maj = sélection multiple.</small>")
+        return True  # pour GLib.timeout_add
+
+    def _reselect(self, model, path, it, data):
+        prev, sel = data
+        if model.get_value(it, self.COL_PID) in prev:
+            sel.select_path(path)
+        return False
+
+    # --- cycle de vie ---
+    def start_timer(self):
+        self.refresh()
+        if self._timer is None:
+            self._timer = GLib.timeout_add_seconds(UI_REFRESH, self.refresh)
+
+    def stop_timer(self):
+        if self._timer is not None:
+            GLib.source_remove(self._timer)
+            self._timer = None
+
+    def _on_close(self, *_):
+        self.stop_timer()
+        self.hide()
+        return True  # ne pas détruire : on garde l'app vivante (tray + monitor)
+
+    def _on_key(self, _w, ev):
+        if ev.keyval == Gdk.KEY_Escape:
+            self._on_close()
+            return True
+        return False
+
+
+# ============================================================================
+#  Application : monitor (boîte noire) + icône de barre des tâches
+# ============================================================================
+class MemGuard:
+    def __init__(self):
+        self.win = None
+        self.last_notify = 0
+        self.indicator = None
+        self._harden_priority()
+        self._build_indicator()
+        # SIGUSR1 = réveil instantané depuis le raccourci clavier, sans relancer
+        # un interpréteur python (vital quand le PC swappe à mort)
+        try:
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGUSR1,
+                                 lambda *_: (self.show_window(), True)[1])
+        except Exception:
+            pass
+        # première mesure immédiate puis boucle
+        self.monitor_tick()
+        GLib.timeout_add_seconds(INTERVAL, self.monitor_tick)
+
+    def _harden_priority(self):
+        """Immunité OOM + priorité CPU réelles. Un service --user ne PEUT PAS
+        abaisser son oom_score_adj ni passer en nice négatif sans privilège :
+        on le fait via sudo -n (NOPASSWD). Best-effort, silencieux si refusé."""
+        pid = os.getpid()
+        try:
+            subprocess.run(
+                ["sudo", "-n", "sh", "-c",
+                 "echo -1000 > /proc/%d/oom_score_adj" % pid],
+                capture_output=True, timeout=3)
+        except Exception:
+            pass
+        try:
+            subprocess.run(["sudo", "-n", "renice", "-n", "-5", "-p", str(pid)],
+                          capture_output=True, timeout=3)
+        except Exception:
+            pass
+
+    # --- icône barre des tâches ---
+    def _build_indicator(self):
+        menu = Gtk.Menu()
+
+        self.mi_open = Gtk.MenuItem(label="Ouvrir le gestionnaire")
+        self.mi_open.connect("activate", lambda *_: self.show_window())
+        menu.append(self.mi_open)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        self.mi_stat = Gtk.MenuItem(label="RAM — · Swap —")
+        self.mi_stat.set_sensitive(False)
+        menu.append(self.mi_stat)
+        menu.append(Gtk.SeparatorMenuItem())
+
+        mi_quit = Gtk.MenuItem(label="Quitter mem-guard")
+        mi_quit.connect("activate", lambda *_: self._quit())
+        menu.append(mi_quit)
+        menu.show_all()
+        self.menu = menu
+
+        if AppIndicator is not None:
+            cls = getattr(AppIndicator,
+                          "Indicator" if hasattr(AppIndicator, "Indicator")
+                          else "AppIndicator")
+            cat = AppIndicator.IndicatorCategory.SYSTEM_SERVICES
+            self.indicator = AppIndicator.Indicator.new(
+                "mem-guard", "utilities-system-monitor", cat)
+            self.indicator.set_status(AppIndicator.IndicatorStatus.ACTIVE)
+            self.indicator.set_title("mem-guard")
+            self.indicator.set_menu(menu)
+            # clic-molette ouvre directement le gestionnaire
+            try:
+                self.indicator.set_secondary_activate_target(self.mi_open)
+            except Exception:
+                pass
+        else:
+            # repli : Gtk.StatusIcon (clic gauche = ouvrir)
+            self.tray = Gtk.StatusIcon.new_from_icon_name(
+                "utilities-system-monitor")
+            self.tray.set_tooltip_text("mem-guard")
+            self.tray.connect("activate", lambda *_: self.show_window())
+            self.tray.connect(
+                "popup-menu",
+                lambda icon, b, t: menu.popup(None, None,
+                                             Gtk.StatusIcon.position_menu,
+                                             icon, b, t))
+
+    def _set_icon(self, state):
+        icon = {"crit": "dialog-error", "warn": "dialog-warning"}.get(
+            state, "utilities-system-monitor")
+        if self.indicator is not None:
+            self.indicator.set_icon_full(icon, "mem-guard")
+        elif hasattr(self, "tray"):
+            self.tray.set_from_icon_name(icon)
+
+    def _quit(self):
+        gapp = Gio.Application.get_default()
+        if gapp is not None:
+            gapp.quit()
+        else:
+            Gtk.main_quit()
+
+    # --- fenêtre ---
+    def show_window(self):
+        if self.win is None:
+            self.win = ProcessWindow(self)
+        # priorité visuelle : au-dessus de tout, sur tous les bureaux, focus forcé
+        self.win.set_keep_above(True)
+        self.win.stick()
+        self.win.show_all()
+        self.win.present_with_time(Gdk.CURRENT_TIME)
+        self.win.start_timer()
+
+    # --- notifications ---
+    def notify(self, urgency, title, body):
+        now = time.time()
+        if now - self.last_notify < NOTIFY_THROTTLE:
+            return
+        self.last_notify = now
+        if not HAVE_NOTIFY:
+            return
+        n = Notify.Notification.new(title, body, "utilities-system-monitor")
+        urg = {"critical": Notify.Urgency.CRITICAL,
+               "normal": Notify.Urgency.NORMAL}.get(urgency, Notify.Urgency.NORMAL)
+        n.set_urgency(urg)
+        # clic sur la notif -> ouvre le gestionnaire
+        n.add_action("default", "Ouvrir", lambda *_: self.show_window())
+        n.add_action("open", "Ouvrir le gestionnaire",
+                     lambda *_: self.show_window())
+        self._last_n = n  # garder une réf, sinon l'action ne se déclenche pas
+        try:
+            n.show()
+        except Exception:
+            pass
+
+    # --- boîte noire + alertes (port du mem-guard.sh) ---
+    def monitor_tick(self):
+        try:
+            m = read_mem()
+        except Exception:
+            return True
+        mem_pct, swap_pct = m["mem_pct"], m["swap_pct"]
+        load = os.getloadavg()[0]
+
+        def count(pat):
+            try:
+                return sum(1 for p in psutil.process_iter(["name", "cmdline"])
+                          if pat in (p.info["name"] or "")
+                          or any(pat in c for c in (p.info["cmdline"] or [])))
+            except Exception:
+                return 0
+
+        n_claude = count("claude")
+        n_node = count("node")
+        n_chrome = count("chrome")
+
+        # top process RAM
+        top = sorted(psutil.process_iter(["name", "memory_info"]),
+                     key=lambda p: (p.info["memory_info"].rss
+                                    if p.info["memory_info"] else 0),
+                     reverse=True)
+        top1 = ""
+        if top:
+            t = top[0]
+            top1 = f"{t.info['name']}:{human_mb(t.info['memory_info'].rss)}MB"
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        daily = os.path.join(STATE_DIR, datetime.now().strftime("%Y-%m-%d") + ".log")
+        with open(daily, "a") as fh:
+            fh.write(f"{ts},mem={mem_pct}%,swap={swap_pct}%,load={load},"
+                     f"claude={n_claude},node={n_node},chrome={n_chrome},"
+                     f"top={top1}\n")
+
+        # indicateur : libellé + couleur d'icône
+        self.mi_stat.set_label(f"RAM {mem_pct} % · Swap {swap_pct} %")
+        if self.indicator is not None:
+            try:
+                self.indicator.set_label(f"{mem_pct}%", "100%")
+            except Exception:
+                pass
+
+        # alertes (mêmes seuils que l'original)
+        if mem_pct >= CRIT_PCT:
+            self._set_icon("crit")
+            inc = os.path.join(STATE_DIR,
+                               "incident-" + datetime.now().strftime("%Y-%m-%d_%H%M%S") + ".log")
+            with open(inc, "a") as fh:
+                fh.write(f"=== INCIDENT MÉMOIRE CRITIQUE {ts} ===\n")
+                fh.write(f"RAM {mem_pct}% | swap {swap_pct}% | load {load}\n")
+                fh.write(f"claude={n_claude} node={n_node} chrome={n_chrome}\n")
+                fh.write("--- Top process RAM ---\n")
+                for p in top[:8]:
+                    try:
+                        fh.write(f"  {p.pid:<6} {human_mb(p.info['memory_info'].rss):>7} Mo  "
+                                 f"{p.info['name']}\n")
+                    except Exception:
+                        pass
+            self.notify("critical", f"⚠ RAM critique {mem_pct} %",
+                        f"swap {swap_pct} % · {n_claude} claude / {n_node} node. "
+                        f"Clique pour ouvrir le gestionnaire.")
+        elif mem_pct >= WARN_PCT:
+            self._set_icon("warn")
+            self.notify("normal", f"RAM élevée {mem_pct} %",
+                        f"swap {swap_pct} % · {n_claude} claude / {n_node} node "
+                        f"/ {n_chrome} chrome")
+        elif swap_pct >= SWAP_WARN:
+            self._set_icon("warn")
+            self.notify("normal", f"Swap élevé {swap_pct} %",
+                        f"RAM {mem_pct} % · risque de ralentissement (thrashing)")
+        else:
+            self._set_icon("ok")
+
+        # rotation des logs journaliers
+        cutoff = time.time() - RETENTION_DAYS * 86400
+        for f in os.listdir(STATE_DIR):
+            fp = os.path.join(STATE_DIR, f)
+            if f.endswith(".log") and os.path.isfile(fp) and os.path.getmtime(fp) < cutoff:
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass
+        return True  # GLib : répéter
+
+
+class MemGuardApp(Gtk.Application):
+    """Enveloppe instance-unique : un seul tray, la 2e invocation ouvre la fenêtre."""
+
+    def __init__(self):
+        super().__init__(application_id="org.rony.memguard",
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.ctrl = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.ctrl = MemGuard()   # construit l'icône + démarre la boîte noire
+        self.hold()              # rester vivant sans fenêtre (tray + monitor)
+
+    def do_command_line(self, cl):
+        args = cl.get_arguments()
+        if "--open" in args:
+            self.ctrl.show_window()
+        return 0
+
+    def do_activate(self):
+        if self.ctrl is not None:
+            self.ctrl.show_window()
+
+
+def main():
+    app = MemGuardApp()
+    return app.run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

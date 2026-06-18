@@ -1,0 +1,28 @@
+[Unit]
+Description=mem-guard — boîte noire mémoire + gestionnaire de crise RAM/CPU
+Documentation=https://github.com/QrCommunication/mem-guard
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/mem-guard
+Restart=always
+RestartSec=10
+# App GTK + tray : besoin de X11 et du bus de session
+Environment=DISPLAY=:0
+Environment=GDK_BACKEND=x11
+PassEnvironment=DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS
+# --- PRIORITÉ SUR TOUT (rester réactif quand le PC OOM/thrashe) ---
+# Immunité OOM (le -1000 effectif est appliqué par l'app via sudo -n au boot,
+# car un service --user ne peut pas abaisser son oom_score_adj sans privilège)
+OOMScoreAdjust=-1000
+OOMPolicy=continue
+CPUWeight=10000
+IOWeight=10000
+Nice=-5
+MemoryHigh=300M
+MemoryMax=400M
+
+[Install]
+WantedBy=graphical-session.target
