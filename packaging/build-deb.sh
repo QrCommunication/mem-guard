@@ -33,6 +33,9 @@ install -m 0644 "$ROOT/data/mem-guard.desktop" "$BUILD/usr/share/applications/me
 # --- Documentation ----------------------------------------------------------
 install -m 0644 "$ROOT/README.md"   "$BUILD/usr/share/doc/$PKG/README.md"
 install -m 0644 "$ROOT/LICENSE"     "$BUILD/usr/share/doc/$PKG/copyright"
+install -m 0755 "$ROOT/scripts/setup-shortcut.sh" "$BUILD/usr/share/doc/$PKG/setup-shortcut.sh"
+mkdir -p "$BUILD/usr/share/doc/$PKG/docs"
+install -m 0644 "$ROOT"/docs/*.md   "$BUILD/usr/share/doc/$PKG/docs/" 2>/dev/null || true
 gzip -9 -n -c "$ROOT/CHANGELOG.md" > "$BUILD/usr/share/doc/$PKG/changelog.gz"
 
 # --- control ----------------------------------------------------------------

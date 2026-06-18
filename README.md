@@ -123,6 +123,21 @@ Détails techniques notables :
 
 ---
 
+## Documentation
+
+| Guide | Contenu |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | Installation, raccourci Ctrl+Alt+Suppr, immunité OOM, mapping kitty, désinstallation, migration |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | Lancer depuis les sources, **reconstruire le `.deb`**, bumper la version, publier une release, notes de packaging |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Fonctionnement interne : instance unique, boîte noire, résolution des titres de fenêtre (kitty/tmux/X11), priorité OOM/CPU, réveil instantané |
+| [CHANGELOG.md](CHANGELOG.md) | Historique des versions |
+
+**Reconstruire le `.deb` après une modif des sources :**
+
+```bash
+./packaging/build-deb.sh        # → dist/mem-guard_<version>_all.deb
+```
+
 ## Licence
 
 [MIT](LICENSE) © 2026 Rony.
